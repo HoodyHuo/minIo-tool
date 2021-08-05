@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 )
 
 /**
@@ -23,27 +24,22 @@ func backup(minioClient *minio.Client, dir string, bucketName string) error {
 			return err
 		}
 		for _, bucket := range buckets {
-			err := backupBucket(minioClient, dir, bucket.Name)
-			if err != nil {
-				return err
-			}
+			backupBucket(minioClient, dir, bucket.Name)
 		}
 	} else {
-		err := backupBucket(minioClient, dir, bucketName)
-		if err != nil {
-			return err
-		}
+		backupBucket(minioClient, dir, bucketName)
 	}
 	return nil
 }
 
-func backupBucket(minioClient *minio.Client, dir string, bucketName string) error {
-	//桶路径
+func backupBucket(minioClient *minio.Client, dir string, bucketName string) {
 	log.Printf("\rstart backup bucket %s", bucketName)
+	//桶路径
 	bucketDir := path.Join(dir, bucketName)
 	err := os.MkdirAll(bucketDir, 0777)
 	if err != nil {
-		return err
+		log.Println(err)
+		os.Exit(1)
 	}
 	//桶内文件
 	objectsInfo := minioClient.ListObjects(context.Background(), bucketName, minio.ListObjectsOptions{WithMetadata: true, Recursive: true})
@@ -61,39 +57,55 @@ func backupBucket(minioClient *minio.Client, dir string, bucketName string) erro
 		progressbar.OptionClearOnFinish(), //进度满了就自动清除
 		progressbar.OptionShowCount())     //进度条开始
 
-	for _, obj := range objectNames {
-		err4, done := funcName(minioClient, bucketName, obj, bucketDir, bar)
-		if done {
-			return err4
-		}
-	}
+	//创建chan
+	objectsChan := make(chan minio.ObjectInfo, 4)
+	wg := sync.WaitGroup{}
+	wg.Add(len(objectNames))
+	go dispatchBackupObjects(objectsChan, bucketName, bucketDir, bar, minioClient, &wg)
 
+	for _, obj := range objectNames {
+		objectsChan <- obj
+	}
+	wg.Wait()
 	log.Printf("\rbucket %s backup finished, total %d objects (%.2fMb)", bucketName, len(objectNames), float64(totalSize)/1024/1024)
-	return nil
 }
 
-func funcName(minioClient *minio.Client, bucketName string, obj minio.ObjectInfo, bucketDir string, bar *progressbar.ProgressBar) (error, bool) {
-	objectInfo, err := minioClient.GetObject(context.Background(), bucketName, obj.Key, minio.GetObjectOptions{})
-	if err != nil {
-		return err, true
+func dispatchBackupObjects(objectsChan chan minio.ObjectInfo, bucketName string, bucketDir string, bar *progressbar.ProgressBar, minioClient *minio.Client, wg *sync.WaitGroup) {
+	for info := range objectsChan {
+		backupObject(info, bucketName, bucketDir, bar, minioClient, wg)
 	}
-	fullPath := path.Join(bucketDir, obj.Key)
+}
+
+func backupObject(object minio.ObjectInfo, bucketName string, bucketDir string, bar *progressbar.ProgressBar, minioClient *minio.Client, wg *sync.WaitGroup) {
+	getObject, err := minioClient.GetObject(context.Background(), bucketName, object.Key, minio.GetObjectOptions{})
+	if err != nil {
+		log.Println(err)
+		os.Exit(1)
+	}
+	//构建路径
+	fullPath := path.Join(bucketDir, object.Key)
 	p := fullPath[0:strings.LastIndex(fullPath, "/")]
 	err2 := os.MkdirAll(p, 0777)
 	if err2 != nil {
-		return err2, true
+		log.Println(err2)
+		os.Exit(1)
 	}
-
+	//创建文件
 	localFile, err3 := os.Create(fullPath)
 	if err3 != nil {
-		return err3, true
+		log.Println(err3)
+		os.Exit(1)
 	}
-	if _, err4 := io.Copy(localFile, objectInfo); err != nil {
-		return err4, true
+	//写文件
+	if _, err4 := io.Copy(localFile, getObject); err != nil {
+		log.Println(err4)
+		os.Exit(1)
 	}
-	err5 := bar.Add64(obj.Size)
+	//更新进度条、任务组
+	err5 := bar.Add64(object.Size)
 	if err5 != nil {
-		return err5, true
+		log.Println(err5)
+		os.Exit(1)
 	}
-	return nil, false
+	wg.Done()
 }
